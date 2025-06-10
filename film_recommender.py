@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm, trange
 import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
 
 # Set device to CUDA if available
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -23,6 +24,11 @@ MOVIES_FILE = os.path.join(DATASET_FOLDER, "movies.csv")
 
 df_ratings = pd.read_csv(RATINGS_FILE)
 df_movies = pd.read_csv(MOVIES_FILE)
+
+# Prepare lists for parallel processing
+movieId_list = df_movies.movieId.tolist()
+title_list = df_movies.title.tolist()
+genre_list = df_movies.genres.tolist()
 
 # clean the ratings data
 df_ratings = df_ratings.dropna()
@@ -48,43 +54,82 @@ print("movies with enough ratings: ", len(df_movies_to_num_ratings))
 # get list of the top movies by number of ratings.
 top_movies = df_movies_to_num_ratings.movieId.tolist()
 
-movieId_to_num_ratings = {}
-movieId_list = df_movies_to_num_ratings.movieId.tolist()
+# Now create rating_list for parallel processing
 rating_list = df_movies_to_num_ratings.rating.tolist()
-for i in range(len(movieId_list)):
-    movieId_to_num_ratings[movieId_list[i]] = rating_list[i]
 
+# Only now, after df_ratings_final is defined, do the parallel processing
 
 df_ratings_final = df_ratings[df_ratings.movieId.isin(top_movies)]
+
+from concurrent.futures import ThreadPoolExecutor
+
+movieId_to_num_ratings = {}
+
+# Use filtered lists for parallel processing
+filtered_movieId_list = df_movies_to_num_ratings.movieId.tolist()
+filtered_rating_list = df_movies_to_num_ratings.rating.tolist()
+
+
+def build_movieId_to_num_ratings(i, movieId_list, rating_list):
+    return (movieId_list[i], rating_list[i])
+
+
+with ThreadPoolExecutor() as executor:
+    for movieId, rating in executor.map(
+        build_movieId_to_num_ratings,
+        range(len(filtered_movieId_list)),
+        [filtered_movieId_list] * len(filtered_movieId_list),
+        [filtered_rating_list] * len(filtered_movieId_list),
+    ):
+        movieId_to_num_ratings[movieId] = rating
+
 movieId_to_title = {}
 title_to_movieId = {}
 
-movieId_list = df_movies.movieId.tolist()
-title_list = df_movies.title.tolist()
 
-for i in range(len(movieId_list)):
+def build_title_maps(i, movieId_list, title_list):
     movieId = movieId_list[i]
     title = title_list[i]
+    return (movieId, title)
 
-    movieId_to_title[movieId] = title
-    title_to_movieId[title] = movieId
-# map movieId to list of genres for that movie
+
+with ThreadPoolExecutor() as executor:
+    for movieId, title in executor.map(
+        build_title_maps,
+        range(len(movieId_list)),
+        [movieId_list] * len(movieId_list),
+        [title_list] * len(movieId_list),
+    ):
+        movieId_to_title[movieId] = title
+        title_to_movieId[title] = movieId
+
 genres = set()
 movieId_to_genres = {}
 
-movieId_list = df_movies.movieId.tolist()
-genre_list = df_movies.genres.tolist()
 
-for i in range(len(movieId_list)):
+def build_genre_maps(i, movieId_list, genre_list, top_movies):
     movieId = movieId_list[i]
     if movieId not in top_movies:
-        continue
-
-    movieId_to_genres[movieId] = set()
-
+        return None
+    genre_set = set()
     for genre in genre_list[i].split("|"):
-        genres.add(genre)
-        movieId_to_genres[movieId].add(genre)
+        genre_set.add(genre)
+    return (movieId, genre_set, genre_list[i])
+
+
+with ThreadPoolExecutor() as executor:
+    for result in executor.map(
+        build_genre_maps,
+        range(len(movieId_list)),
+        [movieId_list] * len(movieId_list),
+        [genre_list] * len(movieId_list),
+        [top_movies] * len(movieId_list),
+    ):
+        if result is not None:
+            movieId, genre_set, genre_str = result
+            movieId_to_genres[movieId] = genre_set
+            for genre in genre_set:
+                genres.add(genre)
 
 df_movies_to_avg_rating = df_ratings_final.groupby("movieId", as_index=False)[
     "rating"
