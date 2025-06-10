@@ -5,6 +5,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from tqdm import tqdm, trange
+import concurrent.futures
 
 # Set device to CUDA if available
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -133,102 +134,103 @@ def preprocess_dataset(df_ratings_aggregated):
     user_context_i_to_genre = {i: s for s, i in user_context_genre_to_i.items()}
     percent_ratings_as_watch_history = 0.8
 
-    user_to_movie_to_rating_WATCH_HISTORY = {}
-    user_to_movie_to_rating_LABEL = {}
-
-    # loop over each column as this is much, much faster than going row by row.
     user_list = df_ratings_aggregated["userId"].tolist()
     movieId_list_list = df_ratings_aggregated["movieId"].tolist()
     rating_list_list = df_ratings_aggregated["rating"].tolist()
 
-    for i in range(len(user_list)):
+    def process_user(i):
         userId = user_list[i]
         movieId_list = movieId_list_list[i]
         rating_list = rating_list_list[i]
-
         num_rated_movies = len(movieId_list)
-
-        # ignore users with too few ratings.
         if num_rated_movies <= 5:
-            continue
-
-        # set up training example maps.
-        user_to_movie_to_rating_WATCH_HISTORY[userId] = {}
-        user_to_movie_to_rating_LABEL[userId] = {}
-
-        # shuffle the user's movies that they have watched
+            return None
+        user_watch = {}
+        user_label = {}
         rated_movies = list(zip(movieId_list, rating_list))
         random.shuffle(rated_movies)
-
-        # put some movies into user's watch history (features) and leave others as labels to predict.
         for movieId, rating in rated_movies[
             : int(num_rated_movies * percent_ratings_as_watch_history)
         ]:
-            user_to_movie_to_rating_WATCH_HISTORY[userId][movieId] = rating
+            user_watch[movieId] = rating
         for movieId, rating in rated_movies[
             int(num_rated_movies * percent_ratings_as_watch_history) :
         ]:
-            user_to_movie_to_rating_LABEL[userId][movieId] = rating
-    user_to_avg_rating = {}
+            user_label[movieId] = rating
+        return (userId, user_watch, user_label)
 
-    # NOTE: only use ratings from their synthetic watch history.
+    user_to_movie_to_rating_WATCH_HISTORY = {}
+    user_to_movie_to_rating_LABEL = {}
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        results = list(executor.map(process_user, range(len(user_list))))
+    for res in results:
+        if res is not None:
+            userId, user_watch, user_label = res
+            user_to_movie_to_rating_WATCH_HISTORY[userId] = user_watch
+            user_to_movie_to_rating_LABEL[userId] = user_label
+
+    user_to_avg_rating = {}
     for user in user_to_movie_to_rating_WATCH_HISTORY.keys():
         user_to_avg_rating[user] = 0
         for movieId in user_to_movie_to_rating_WATCH_HISTORY[user].keys():
             user_to_avg_rating[user] += user_to_movie_to_rating_WATCH_HISTORY[user][
                 movieId
             ]
-
         user_to_avg_rating[user] /= len(
             user_to_movie_to_rating_WATCH_HISTORY[user].keys()
         )
-    # for every user, get the avg rating for every genre
+
     user_to_genre_to_stat = {}
 
-    # NOTE: only use ratings from their synthetic watch history.
-    for user in user_to_movie_to_rating_WATCH_HISTORY.keys():
-        user_to_genre_to_stat[user] = {}
+    def process_user_genre(user):
+        genre_stat = {}
         for movieId in user_to_movie_to_rating_WATCH_HISTORY[user].keys():
             for genre in movieId_to_genres[movieId]:
-                if genre not in user_to_genre_to_stat[user]:
-                    user_to_genre_to_stat[user][genre] = {
-                        "NUM_RATINGS": 0,
-                        "SUM_RATINGS": 0,
-                    }
-
-                user_to_genre_to_stat[user][genre]["NUM_RATINGS"] += 1
-                user_to_genre_to_stat[user][genre][
+                if genre not in genre_stat:
+                    genre_stat[genre] = {"NUM_RATINGS": 0, "SUM_RATINGS": 0}
+                genre_stat[genre]["NUM_RATINGS"] += 1
+                genre_stat[genre][
                     "SUM_RATINGS"
                 ] += user_to_movie_to_rating_WATCH_HISTORY[user][movieId]
+        return (user, genre_stat)
 
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        genre_results = list(
+            executor.map(
+                process_user_genre, user_to_movie_to_rating_WATCH_HISTORY.keys()
+            )
+        )
+    for user, genre_stat in genre_results:
+        user_to_genre_to_stat[user] = genre_stat
     for user in user_to_genre_to_stat.keys():
         for genre in user_to_genre_to_stat[user].keys():
             num_ratings = user_to_genre_to_stat[user][genre]["NUM_RATINGS"]
             sum_ratings = user_to_genre_to_stat[user][genre]["SUM_RATINGS"]
             user_to_genre_to_stat[user][genre]["AVG_RATING"] = sum_ratings / num_ratings
-    # for every user, create the training example user context vector
-    # 0:num_user_context_movies -> user's watch history
-    # num_user_context_movies:num_user_context_movies+num_genres -> user's genre affinity
     user_to_context = {}
-    for user in user_to_movie_to_rating_WATCH_HISTORY.keys():
-        context = [0.0] * user_context_size
 
+    def process_user_context(user):
+        context = [0.0] * user_context_size
         for movieId in user_to_movie_to_rating_WATCH_HISTORY[user].keys():
             if movieId in user_context_movies:
-                # note, we debias the rating so if the rating is under the user's avg rating,
-                # it will hopefully count as negative strength for predicting similar movies.
-                # vice-versa for a rating above the user's average.
                 context[user_context_movieId_to_i[movieId]] = float(
                     user_to_movie_to_rating_WATCH_HISTORY[user][movieId]
                     - user_to_avg_rating[user]
                 )
-
         for genre in user_to_genre_to_stat[user].keys():
             context[user_context_genre_to_i[genre]] = float(
                 user_to_genre_to_stat[user][genre]["AVG_RATING"]
                 - user_to_avg_rating[user]
             )
+        return (user, context)
 
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        context_results = list(
+            executor.map(
+                process_user_context, user_to_movie_to_rating_WATCH_HISTORY.keys()
+            )
+        )
+    for user, context in context_results:
         user_to_context[user] = context
     return (user_to_movie_to_rating_LABEL, user_to_context, user_to_avg_rating)
 
@@ -274,10 +276,10 @@ def build_dataset(
                 )
             )
 
-    X = torch.tensor(X)
-    Y = torch.tensor(Y)
-    target_movieId = torch.tensor(target_movieId)
-    target_movieId_context = torch.tensor(target_movieId_context)
+    X = torch.tensor(X, device=DEVICE)
+    Y = torch.tensor(Y, device=DEVICE)
+    target_movieId = torch.tensor(target_movieId, device=DEVICE)
+    target_movieId_context = torch.tensor(target_movieId_context, device=DEVICE)
 
     return X, Y, target_movieId, target_movieId_context
 
