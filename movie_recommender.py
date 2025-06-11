@@ -168,15 +168,16 @@ for movieId in top_movies:
 
     movieId_to_context[movieId] = context
 
+user_context_movieId_to_i = {s: i for i, s in enumerate(list(user_context_movies))}
+# user_context_i_to_movieId = {i: s for s, i in user_context_movieId_to_i.items()}
+
+user_context_genre_to_i = {
+    s: i + len(user_context_movies) for i, s in enumerate(list(genres))
+}
+# user_context_i_to_genre = {i: s for s, i in user_context_genre_to_i.items()}
+
 
 def preprocess_dataset(df_ratings_aggregated):
-    user_context_movieId_to_i = {s: i for i, s in enumerate(list(user_context_movies))}
-    user_context_i_to_movieId = {i: s for s, i in user_context_movieId_to_i.items()}
-
-    user_context_genre_to_i = {
-        s: i + len(user_context_movies) for i, s in enumerate(list(genres))
-    }
-    user_context_i_to_genre = {i: s for s, i in user_context_genre_to_i.items()}
     percent_ratings_as_watch_history = 0.8
 
     user_list = df_ratings_aggregated["userId"].tolist()
@@ -289,7 +290,7 @@ def build_dataset(
     movieId_to_context,
     user_to_avg_rating,
 ):
-    # the user context (i.e. the watch hisotyr and genre affinities)
+    # the user context (i.e. the watch history and genre affinities)
     X = []
 
     # the movieID for the movie we will predict rating for.
@@ -390,7 +391,7 @@ user_feature_embedding_size = (
     50  # must be the concat dimension of both item embeddings.
 )
 
-minibatch_size = 64
+minibatch_size = 128
 
 
 class FilmRecommenderNet(nn.Module):
@@ -571,7 +572,7 @@ def train_model(
 
 
 # Check if model already exists
-model_path = "film_recommender_model.pth"
+model_path = "movie_recommender_model.pth"
 if os.path.exists(model_path):
     print(f"Loading existing model from {model_path}")
     model.load_state_dict(torch.load(model_path, map_location=DEVICE))
@@ -641,9 +642,8 @@ def compute_similarities_vectorized(movieId_to_embedding, top_movies, k=5):
         "MOVIE_EMBEDDING_COMBINED",
     ]
 
-    for emb_type in tqdm(
-        embedding_types, desc="Computing similarities", unit="embedding_type"
-    ):
+    for emb_type in embedding_types:
+        print(f"Computing similarities for embedding type: {emb_type}...")
         # Stack all embeddings for this type
         embeddings = torch.stack(
             [
@@ -660,7 +660,9 @@ def compute_similarities_vectorized(movieId_to_embedding, top_movies, k=5):
             distances, k=k + 1, largest=False
         )  # +1 to exclude self
 
-        for i, movieId in enumerate(top_movies[:15]):  # Only for first 5 movies
+        for i, movieId in tqdm(
+            enumerate(top_movies), desc="Computing similarities", unit="movieId"
+        ):
             if movieId not in similarities:
                 similarities[movieId] = {}
 
@@ -676,19 +678,125 @@ def compute_similarities_vectorized(movieId_to_embedding, top_movies, k=5):
     return similarities
 
 
-# Compute similarities (much faster than nested loops!)
 movieId_to_emb_type_to_similarities = compute_similarities_vectorized(
     movieId_to_embedding, top_movies
 )
 
-# Print results
-print("Top 5 similar movies for each embedding type:")
-for movieId in movieId_to_emb_type_to_similarities.keys():
-    print(f"Movie: {movieId_to_title[movieId]}")
-    for emb_type, similarities in movieId_to_emb_type_to_similarities[movieId].items():
-        print(f"  Embedding Type: {emb_type}")
-        for similar_movie, distance in similarities:
-            print(
-                f"    Similar Movie: {movieId_to_title[similar_movie]} | Distance: {distance:.4f}"
-            )
+user_type_to_favorite_genres = {
+    "Fantasy Lover": ["Fantasy"],
+    "Children's Movie Lover": ["Children"],
+    "Horror Lover": ["Horror"],
+    "Sci-Fi Lover": ["Sci-Fi"],
+    "Comedy Lover": ["Comedy"],
+    "Romance Lover": ["Romance"],
+    "War Movie Lover": ["War"],
+}
+
+user_type_to_worst_genres = {
+    "Fantasy Lover": ["Horror", "Children"],
+    "Children's Movie Lover": ["Horror", "Romance", "Drama"],
+    "Horror Lover": ["Children"],
+    "Sci-Fi Lover": ["Romance", "Children"],
+    "Comedy Lover": ["Children"],
+    "Romance Lover": ["Children", "Horror"],
+    "War Movie Lover": ["Children"],
+}
+
+user_type_to_favorite_movies = {
+    "Fantasy Lover": [
+        "Lord of the Rings: The Fellowship of the Ring, The (2001)",
+        "Gladiator (2000)",
+        "300 (2007)",
+        "Braveheart (1995)",
+    ],
+    "Children's Movie Lover": [
+        "Toy Story 2 (1999)",
+        "Finding Nemo (2003)",
+        "Monsters, Inc. (2001)",
+    ],
+    "Horror Lover": [
+        "Blair Witch Project, The (1999)",
+        "Silence of the Lambs, The (1991)",
+        "Sixth Sense, The (1999)",
+    ],
+    "Sci-Fi Lover": [
+        "Star Wars: Episode V - The Empire Strikes Back (1980)",
+        "Matrix, The (1999)",
+        "Terminator, The (1984)",
+    ],
+    "Comedy Lover": [
+        "American Pie (1999)",
+        "Dumb & Dumber (Dumb and Dumber) (1994)",
+        "Austin Powers: The Spy Who Shagged Me (1999)",
+        "Big Lebowski, The (1998)",
+    ],
+    "Romance Lover": [
+        "Shakespeare in Love (1998)",
+        "There's Something About Mary (1998)",
+        "Sense and Sensibility (1995)",
+    ],
+    "War Movie Lover": [
+        "Saving Private Ryan (1998)",
+        "Apocalypse Now (1979)",
+        "Full Metal Jacket (1987)",
+    ],
+}
+
+user_to_inference_context = {}
+
+for user_type in user_type_to_favorite_genres.keys():
+    inference_user_context = [0.0] * user_context_size
+
+    # set genres the user likes.
+    for genre in user_type_to_favorite_genres[user_type]:
+        inference_user_context[user_context_genre_to_i[genre]] = float(2.0)
+
+    # set genres that the user dislikes
+    for genre in user_type_to_worst_genres[user_type]:
+        inference_user_context[user_context_genre_to_i[genre]] = float(-2.0)
+
+    # set the user's favorite movies.
+    for title in user_type_to_favorite_movies[user_type]:
+        movieId = title_to_movieId[title]
+        inference_user_context[user_context_movieId_to_i[movieId]] = float(2.0)
+
+    user_to_inference_context[user_type] = inference_user_context
+
+user_to_top_recs = {}
+
+for user_type in user_to_inference_context.keys():
+
+    X_inference = torch.tensor(
+        [user_to_inference_context[user_type]], device=DEVICE, dtype=torch.float32
+    )
+    model.eval()
+    with torch.no_grad():
+        user_embedding_inference = torch.tanh(model.u_W1(X_inference))
+
+    movieId_to_pred_score = {}
+    for movieId in top_movies:
+        # we already have the combined item embedding for every movie to make inference easier.
+        item_embedding_combined_inference = movieId_to_embedding[movieId][
+            "MOVIE_EMBEDDING_COMBINED"
+        ]
+        movieId_to_pred_score[movieId] = torch.einsum(
+            "ij, ij -> i", user_embedding_inference, item_embedding_combined_inference
+        ).item()
+
+    top_recs = []
+    for movieId, pred_score in list(
+        sorted(movieId_to_pred_score.items(), key=lambda item: item[1], reverse=True)
+    ):
+        if len(top_recs) >= 10:
+            break
+        if movieId_to_title[movieId] not in user_type_to_favorite_movies[user_type]:
+            top_recs.append(movieId)
+    user_to_top_recs[user_type] = top_recs
+
+for user_type, recs in user_to_top_recs.items():
+    print(f"Recommendations for {user_type}:")
+    for movieId in recs:
+        print(
+            f"- {movieId_to_title[movieId]} (Predicted Score: {movieId_to_avg_rating[movieId]:.2f})"
+        )
     print()
